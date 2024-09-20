@@ -196,21 +196,17 @@ name(Pool) -> {?MODULE, Pool}.
 %% gen_server callbacks
 %%--------------------------------------------------------------------
 
-init([Pool, Id, Opts]) ->
+init([Pool, Id, Opts0]) ->
     process_flag(trap_exit, true),
-    PrioLatest = proplists:get_bool(prioritise_latest, Opts),
-    #{
-        host := Host,
-        port := Port,
-        proxy := Proxy
-    } = get_host_and_proxy(Opts),
+    PrioLatest = proplists:get_bool(prioritise_latest, Opts0),
+    #{opts := Opts, proxy := Proxy} = parse_proxy_opts(Opts0),
     State = #state{
         pool = Pool,
         id = Id,
         client = ?undef,
         mref = ?undef,
-        host = Host,
-        port = Port,
+        host = proplists:get_value(host, Opts),
+        port = proplists:get_value(port, Opts),
         enable_pipelining = proplists:get_value(enable_pipelining, Opts, false),
         gun_opts = gun_opts(Opts),
         gun_state = down,
@@ -384,7 +380,7 @@ code_change(_Vsn, {state, Pool, ID, Client, MRef, Host, Port, GunOpts, GunState}
         proxy = undefined
     }};
 code_change(_Vsn, {state, Pool, ID, Client, MRef, Host, Port, GunOpts, GunState, Requests}, _) ->
-    %% upgrade from a version before 'enable_pipelining' filed was added
+    %% upgrade from a version before 'enable_pipelining' field was added
     {ok, #state{
         pool = Pool,
         id = ID,
@@ -398,7 +394,7 @@ code_change(_Vsn, {state, Pool, ID, Client, MRef, Host, Port, GunOpts, GunState,
         requests = upgrade_requests(Requests)
     }};
 code_change(_Vsn, State, _) ->
-    %% upgrade from a version ahving old format 'requests' field
+    %% upgrade from a version having old format 'requests' field
     {ok, upgrade_requests(State)}.
 
 format_status(Status = #{state := State}) ->
@@ -941,19 +937,54 @@ fresh_expire_at(infinity = _Timeout) ->
 fresh_expire_at(Timeout) when is_integer(Timeout) ->
     now_() + Timeout.
 
-get_host_and_proxy(Opts) ->
+parse_proxy_opts(Opts) ->
     %% Target host and port
-    Host = proplists:get_value(host, Opts),
-    Port = proplists:get_value(port, Opts),
     case proplists:get_value(proxy, Opts, undefined) of
         undefined ->
-            #{host => Host, port => Port, proxy => undefined};
-        #{host := ProxyHost, port := ProxyPort} = ProxyOpts0 ->
+            #{opts => Opts, proxy => undefined};
+        #{host := _, port := _} = ProxyOpts0 ->
             %% We open connection to proxy, then issue `gun:connect' to target host.
-            ProxyOpts1 = maps:without([host, port], ProxyOpts0),
-            ProxyOpts = ProxyOpts1#{host => Host, port => Port},
-            #{host => ProxyHost, port => ProxyPort, proxy => ProxyOpts}
+            {ProxyOpts, NewOpts} =
+                lists:foldl(
+                  fun(Key, {ProxyAcc, GunAcc}) ->
+                     swap(Key, ProxyAcc, GunAcc)
+                  end,
+                  {ProxyOpts0, proplists:delete(proxy, Opts)},
+                  [host, port, transport]
+                 ),
+            #{opts => NewOpts, proxy => ProxyOpts}
     end.
+
+swap(Key, Map0, Proplist0) when is_map_key(Key, Map0) ->
+    ValueFromMap = maps:get(Key, Map0),
+    Map = maps:remove(Key, Map0),
+    case take_proplist(Key, Proplist0) of
+        {ValueFromProplist, Proplist} ->
+            {Map#{Key => ValueFromProplist}, [{Key, ValueFromMap} | Proplist]};
+        error ->
+            {Map, [{Key, ValueFromMap} | Proplist0]}
+    end;
+swap(Key, Map0, Proplist0) ->
+    case take_proplist(Key, Proplist0) of
+        {ValueFromProplist, Proplist} ->
+            {Map0#{Key => ValueFromProplist}, Proplist};
+        error ->
+            {Map0, Proplist0}
+    end.
+
+take_proplist(Key, Proplist0) ->
+    Proplist1 = lists:keydelete(Key, 1, Proplist0),
+    case lists:keyfind(Key, 1, Proplist0) of
+        false ->
+            error;
+        {Key, ValueFromProplist} ->
+            {ValueFromProplist, Proplist1}
+    end.
+
+put_if(Acc, K, V, true) ->
+    Acc#{K => V};
+put_if(Acc, _K, _V, false) ->
+    Acc.
 
 -ifdef(TEST).
 
