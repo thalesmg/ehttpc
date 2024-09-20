@@ -90,7 +90,8 @@
     enable_pipelining :: boolean() | non_neg_integer(),
     gun_opts :: gun:opts(),
     gun_state :: down | up,
-    requests :: map()
+    requests :: map(),
+    proxy :: undefined | map()
 }).
 
 -type pool_name() :: any().
@@ -198,13 +199,17 @@ name(Pool) -> {?MODULE, Pool}.
 init([Pool, Id, Opts]) ->
     process_flag(trap_exit, true),
     PrioLatest = proplists:get_bool(prioritise_latest, Opts),
+    #{ host := Host
+     , port := Port
+     , proxy := Proxy
+     } = get_host_and_proxy(Opts),
     State = #state{
         pool = Pool,
         id = Id,
         client = ?undef,
         mref = ?undef,
-        host = proplists:get_value(host, Opts),
-        port = proplists:get_value(port, Opts),
+        host = Host,
+        port = Port,
         enable_pipelining = proplists:get_value(enable_pipelining, Opts, false),
         gun_opts = gun_opts(Opts),
         gun_state = down,
@@ -213,7 +218,8 @@ init([Pool, Id, Opts]) ->
             pending_count => 0,
             sent => #{},
             prioritise_latest => PrioLatest
-        }
+        },
+        proxy = Proxy
     },
     true = gproc_pool:connect_worker(ehttpc:name(Pool), {Pool, Id}),
     {ok, State}.
@@ -373,7 +379,8 @@ code_change(_Vsn, {state, Pool, ID, Client, MRef, Host, Port, GunOpts, GunState}
         enable_pipelining = true,
         gun_opts = GunOpts,
         gun_state = GunState,
-        requests = upgrade_requests(#{})
+        requests = upgrade_requests(#{}),
+        proxy = undefined
     }};
 code_change(_Vsn, {state, Pool, ID, Client, MRef, Host, Port, GunOpts, GunState, Requests}, _) ->
     %% upgrade from a version before 'enable_pipelining' filed was added
@@ -776,11 +783,15 @@ do_after_gun_up(State0 = #state{client = Client, mref = MRef}, ExpireAt, Fun) ->
     {Res, State} = gun_await_up(Client, ExpireAt, Timeout, MRef, State0),
     case Res of
         {ok, _} ->
-            Fun(State#state{gun_state = up});
+            Fun(State);
         {error, connect_timeout} ->
             %% the caller can not wait logger
             %% but the connection is likely to be useful
             {reply, {error, connect_timeout}, State};
+        {error, {proxy_error, _} = Error} ->
+            %% We keep the client around because the proxy might still send data as part
+            %% of the error response.
+            {reply, {error, Error}, State};
         {error, Reason} ->
             case is_reference(MRef) of
                 true ->
@@ -798,7 +809,13 @@ do_after_gun_up(State0 = #state{client = Client, mref = MRef}, ExpireAt, Fun) ->
 gun_await_up(Pid, ExpireAt, Timeout, MRef, State0) ->
     receive
         {gun_up, Pid, Protocol} ->
-            {{ok, Protocol}, State0};
+            case State0#state.proxy of
+                undefined ->
+                    State = State0#state{gun_state = up},
+                    {{ok, Protocol}, State};
+                #{} = ProxyOpts ->
+                    gun_connect_proxy(Pid, ExpireAt, Timeout, Protocol, ProxyOpts, State0)
+            end;
         {'DOWN', MRef, process, Pid, {shutdown, Reason}} ->
             %% stale code for appup since 0.4.12
             {{error, Reason}, State0};
@@ -820,6 +837,34 @@ gun_await_up(Pid, ExpireAt, Timeout, MRef, State0) ->
             %% keep waiting
             NewTimeout = timeout(ExpireAt),
             gun_await_up(Pid, ExpireAt, NewTimeout, MRef, State)
+    after Timeout ->
+        {{error, connect_timeout}, State0}
+    end.
+
+gun_connect_proxy(Pid, ExpireAt, Timeout, Protocol, ProxyOpts, State0) ->
+    StreamRef = gun:connect(Pid, ProxyOpts),
+    gun_await_connect_proxy(Pid, StreamRef, ExpireAt, Timeout, Protocol, ProxyOpts, State0).
+
+gun_await_connect_proxy(Pid, StreamRef, ExpireAt, Timeout, Protocol, ProxyOpts, State0) ->
+    receive
+        {gun_response, Pid, StreamRef, fin, 200, Headers} ->
+            State = State0#state{gun_state = up},
+            {{ok, {Protocol, Headers}}, State};
+        {gun_response, Pid, StreamRef, _Fin, 407, _Headers} ->
+            {{error, {proxy_error, unauthorized}}, State0};
+        {gun_response, Pid, StreamRef, _Fin, StatusCode, Headers} ->
+            {{error, {proxy_error, {StatusCode, Headers}}}, State0};
+        ?ASYNC_REQ(Method, Request, ExpireAt1, ResultCallback) ->
+            Req = ?REQ(Method, Request, ExpireAt1),
+            State = enqueue_req(ResultCallback, Req, State0),
+            %% keep waiting
+            NewTimeout = timeout(ExpireAt),
+            gun_await_connect_proxy(Pid, StreamRef, ExpireAt, NewTimeout, Protocol, ProxyOpts, State);
+        ?GEN_CALL_REQ(From, Call) ->
+            State = enqueue_req(From, Call, State0),
+            %% keep waiting
+            NewTimeout = timeout(ExpireAt),
+            gun_await_connect_proxy(Pid, StreamRef, ExpireAt, NewTimeout, Protocol, ProxyOpts, State)
     after Timeout ->
         {{error, connect_timeout}, State0}
     end.
@@ -890,6 +935,20 @@ fresh_expire_at(infinity = _Timeout) ->
     infinity;
 fresh_expire_at(Timeout) when is_integer(Timeout) ->
     now_() + Timeout.
+
+get_host_and_proxy(Opts) ->
+    %% Target host and port
+    Host = proplists:get_value(host, Opts),
+    Port = proplists:get_value(port, Opts),
+    case proplists:get_value(proxy, Opts, undefined) of
+        undefined ->
+            #{host => Host, port => Port, proxy => undefined};
+        #{host := ProxyHost, port := ProxyPort} = ProxyOpts0 ->
+            %% We open connection to proxy, then issue `gun:connect' to target host.
+            ProxyOpts1 = maps:without([host, port], ProxyOpts0),
+            ProxyOpts = ProxyOpts1#{host => Host, port => Port},
+            #{host => ProxyHost, port => ProxyPort, proxy => ProxyOpts}
+    end.
 
 -ifdef(TEST).
 
