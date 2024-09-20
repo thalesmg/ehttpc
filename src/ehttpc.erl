@@ -199,10 +199,11 @@ name(Pool) -> {?MODULE, Pool}.
 init([Pool, Id, Opts]) ->
     process_flag(trap_exit, true),
     PrioLatest = proplists:get_bool(prioritise_latest, Opts),
-    #{ host := Host
-     , port := Port
-     , proxy := Proxy
-     } = get_host_and_proxy(Opts),
+    #{
+        host := Host,
+        port := Port,
+        proxy := Proxy
+    } = get_host_and_proxy(Opts),
     State = #state{
         pool = Pool,
         id = Id,
@@ -859,12 +860,16 @@ gun_await_connect_proxy(Pid, StreamRef, ExpireAt, Timeout, Protocol, ProxyOpts, 
             State = enqueue_req(ResultCallback, Req, State0),
             %% keep waiting
             NewTimeout = timeout(ExpireAt),
-            gun_await_connect_proxy(Pid, StreamRef, ExpireAt, NewTimeout, Protocol, ProxyOpts, State);
+            gun_await_connect_proxy(
+                Pid, StreamRef, ExpireAt, NewTimeout, Protocol, ProxyOpts, State
+            );
         ?GEN_CALL_REQ(From, Call) ->
             State = enqueue_req(From, Call, State0),
             %% keep waiting
             NewTimeout = timeout(ExpireAt),
-            gun_await_connect_proxy(Pid, StreamRef, ExpireAt, NewTimeout, Protocol, ProxyOpts, State)
+            gun_await_connect_proxy(
+                Pid, StreamRef, ExpireAt, NewTimeout, Protocol, ProxyOpts, State
+            )
     after Timeout ->
         {{error, connect_timeout}, State0}
     end.
